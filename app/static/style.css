@@ -54,6 +54,10 @@ th { background: #f0f3f6; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
 tr.gapday td { background: #fdf3e3; }
 tr.rejected td { color: #999; }
+.hours code { display: inline-block; margin: 0 4px 4px 0; }
+.slot-pending { color: #b4560a; font-weight: 600; }
+.slot-regular { color: #2a639b; }
+.slot-verified { color: #2d7a2d; font-weight: 600; }
 .flash {
   border-radius: 6px;
   padding: 10px 14px;

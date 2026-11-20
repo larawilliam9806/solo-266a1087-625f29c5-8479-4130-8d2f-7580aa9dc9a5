@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}补抄单 #{{ order['id'] }} - 电量日核算{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>补抄单 #{{ order['id'] }}：{{ order['point'] }} / {{ order['day'] }}（UTC）</h2>
+  <p class="hint">
+    开单时间 {{ order['created_at'] | fmt_ts }}；当日用量
+    <strong>{{ total | fmt_num }}</strong> kWh（数据版本 v{{ version }}）。
+    单上整点共 {{ slots | length }} 个，仍待补 {{ pending_count }} 个。
+  </p>
+  {% if pending_count %}
+  <p>开单时缺读数的整点（待补 {{ pending_count }} 个）：</p>
+  <p class="hours">
+    {% for s in slots if s.status == 'pending' %}<code>{{ s.ts | fmt_ts }}</code> {% endfor %}
+  </p>
+  {% else %}
+  <p class="hint">单上整点均已到数或已现场核验。</p>
+  {% endif %}
+
+  <h3>按单上传原格式读数 CSV</h3>
+  <p class="hint">
+    表头 <code>point,ts,value</code>。只收本单计量点 <strong>{{ order['point'] }}</strong>
+    和 {{ order['day'] }}（UTC）单上的整点，沿用原读数校验（非负、不得倒退、同刻不同值拒绝）。
+    现场回报与已入库读数同值时也会登记核验，电量只算一次。
+  </p>
+  <form method="post" action="{{ url_for('main.upload', kind='supplement') }}" enctype="multipart/form-data">
+    <input type="hidden" name="order_id" value="{{ order['id'] }}">
+    <input type="file" name="file" accept=".csv" required>
+    <button type="submit">上传补抄读数</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>单上整点状态</h2>
+  <table>
+    <thead><tr><th>整点 (UTC)</th><th>状态</th><th>读数 (kWh)</th></tr></thead>
+    <tbody>
+      {% for s in slots %}
+      <tr class="{{ 'gapday' if s.status == 'pending' else '' }}">
+        <td>{{ s.ts | fmt_ts }}</td>
+        <td><span class="slot-{{ s.status }}">{{ s.label }}</span></td>
+        <td class="num">{{ s.value if s.value is not none else '—' }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="3" class="hint">开单时该日整点读数齐全，单上没有待补整点。</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="card">
+  <h2>本单上传批次</h2>
+  <table>
+    <thead><tr><th>批次</th><th>时间</th><th>文件</th><th>状态</th><th>说明</th></tr></thead>
+    <tbody>
+      {% for u in uploads %}
+      <tr class="{{ u['status'] }}">
+        <td>#{{ u['id'] }}</td>
+        <td>{{ u['created_at'] | fmt_ts }}</td>
+        <td>{{ u['filename'] }}</td>
+        <td>{{ '已生效' if u['status'] == 'applied' else '已拒绝' }}</td>
+        <td>{{ u['message'] }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="hint">尚无上传批次</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

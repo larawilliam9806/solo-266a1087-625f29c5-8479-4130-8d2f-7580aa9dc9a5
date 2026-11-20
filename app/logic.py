@@ -17,14 +17,26 @@
 import bisect
 import csv
 import io
+import sqlite3
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 # 定宽规范化 UTC 时刻：字典序 == 时间序
 TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 MAX_POINT_LEN = 200
 MAX_RANGE_DAYS = 400
+HOURS_PER_DAY = 24
+
+# 补抄单上整点的三种状态
+SLOT_PENDING = "pending"      # 待补：仍无读数
+SLOT_REGULAR = "regular"      # 常规到数：常规上传已带来到数
+SLOT_VERIFIED = "verified"    # 现场已核：已登记现场回报的核验
+SLOT_STATUS_LABELS = {
+    SLOT_PENDING: "待补",
+    SLOT_REGULAR: "常规到数",
+    SLOT_VERIFIED: "现场已核",
+}
 
 
 class CsvError(Exception):
@@ -329,3 +341,275 @@ def apply_swaps(conn, upload_id, keys):
         )
         applied += 1
     return applied, skipped
+
+
+# ---------------------------------------------------------------- 补抄单
+# 整点漏采后，现场人员可从电表取回当时保存的读数。补抄单锁定一个计量点 + 一个已结束的
+# UTC 日，快照“开单时缺读数的整点”；之后可按单分批上传原格式读数 CSV。
+
+def day_bounds(day):
+    """返回某 UTC 日的 [起, 止) 半开区间（规范化字符串）。"""
+    d = parse_day(day) if isinstance(day, str) else day
+    base = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+    return canon_ts(base), canon_ts(base + timedelta(days=1))
+
+
+def hour_marks(day):
+    """某 UTC 日的 24 个整点时刻（规范化字符串，升序）。"""
+    d = parse_day(day) if isinstance(day, str) else day
+    base = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+    return [canon_ts(base + timedelta(hours=h)) for h in range(HOURS_PER_DAY)]
+
+
+def hour_of_day(ts):
+    """规范化时刻所属的 UTC 日整点（丢弃分/秒）。
+
+    若本来就不是整点则原样返回，便于与整点集合比较而识别非整点。
+    """
+    mark = ts[:13] + ":00:00.000000Z"
+    return mark if ts == mark else ts
+
+
+def last_closed_day():
+    """最近一个已结束的 UTC 日（昨天）。"""
+    return (datetime.now(timezone.utc).date() - timedelta(days=1))
+
+
+def is_closed_day(day):
+    return parse_day(day) < datetime.now(timezone.utc).date()
+
+
+def missing_hours(conn, point, day):
+    """该计量点该 UTC 日 00:00~23:00 中当前没有读数的整点（升序）。"""
+    lo, hi = day_bounds(day)
+    have = {
+        r["ts"]
+        for r in conn.execute(
+            "SELECT ts FROM readings WHERE point = ? AND ts >= ? AND ts < ?",
+            (point, lo, hi),
+        ).fetchall()
+    }
+    return [h for h in hour_marks(day) if h not in have]
+
+
+def _get_order(conn, point, day):
+    return conn.execute(
+        "SELECT * FROM supplement_orders WHERE point = ? AND day = ?", (point, day)
+    ).fetchone()
+
+
+class OrderError(Exception):
+    """补抄单操作非法（日期未结束等）。"""
+
+
+def open_order(conn, point, day, created_at=None):
+    """开补抄单；同一点同一天再次开单返回原单（created=False）。
+
+    返回 (order_row, created)。day 必须是已结束的 UTC 日。
+    开单时把当时缺读数的整点快照进 supplement_slots；之后常规到数不会改变单上的整点集合。
+    """
+    day = parse_day(day).strftime("%Y-%m-%d") if isinstance(day, date) else day
+    if not is_closed_day(day):
+        raise OrderError(f"{day} 尚未结束（UTC），不能开补抄单")
+    if len(point) > MAX_POINT_LEN or not point:
+        raise OrderError("计量点为空或名称过长")
+    existing = _get_order(conn, point, day)
+    if existing is not None:
+        return existing, False
+    try:
+        cur = conn.execute(
+            "INSERT INTO supplement_orders(point, day, created_at) VALUES (?,?,?)",
+            (point, day, created_at or now_ts()),
+        )
+    except sqlite3.IntegrityError:
+        # 并发开单：唯一约束兜底，返回已提交的原单
+        return _get_order(conn, point, day), False
+    order_id = cur.lastrowid
+    conn.executemany(
+        "INSERT INTO supplement_slots(order_id, ts) VALUES (?,?)",
+        [(order_id, h) for h in missing_hours(conn, point, day)],
+    )
+    return conn.execute(
+        "SELECT * FROM supplement_orders WHERE id = ?", (order_id,)
+    ).fetchone(), True
+
+
+def list_orders(conn, limit=50):
+    return conn.execute(
+        "SELECT * FROM supplement_orders ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+
+
+def slot_states(conn, order):
+    """补抄单上逐个整点的状态。
+
+    返回 [{'ts', 'status', 'label', 'value'}]，status 取 SLOT_* 之一；
+    value 为对应读数（现场已核时为现场回报值），待补为 None。
+    单上整点仅指开单时快照的缺读数整点；常规到数以已入库读数为准。
+    现场核验优先于常规到数：同值核验也登记，并显示为“现场已核”。
+    """
+    lo, hi = day_bounds(order["day"])
+    have = {
+        r["ts"]: r["value"]
+        for r in conn.execute(
+            "SELECT ts, value FROM readings WHERE point = ? AND ts >= ? AND ts < ?",
+            (order["point"], lo, hi),
+        ).fetchall()
+    }
+    verified = {
+        r["ts"]: r["value"]
+        for r in conn.execute(
+            "SELECT ts, value FROM verifications WHERE order_id = ?", (order["id"],)
+        ).fetchall()
+    }
+    out = []
+    for r in conn.execute(
+        "SELECT ts FROM supplement_slots WHERE order_id = ? ORDER BY ts",
+        (order["id"],),
+    ).fetchall():
+        ts = r["ts"]
+        if ts in verified:
+            status, value = SLOT_VERIFIED, verified[ts]
+        elif ts in have:
+            status, value = SLOT_REGULAR, have[ts]
+        else:
+            status, value = SLOT_PENDING, None
+        out.append(
+            {
+                "ts": ts,
+                "status": status,
+                "label": SLOT_STATUS_LABELS[status],
+                "value": value,
+            }
+        )
+    return out
+
+
+def order_missing_hours(conn, point, day):
+    """该点该日已开单时，单上仍未到数的整点数量；未开单返回 None。"""
+    order = _get_order(conn, point, day)
+    if order is None:
+        return None
+    return sum(1 for s in slot_states(conn, order) if s["status"] == SLOT_PENDING)
+
+
+def usage_with_orders(conn, point, start_day, end_day):
+    """逐日用量 + 已开单日期上仍缺读数的整点数。
+
+    返回 (days, gaps, total, orders)：
+    - days 每行额外带 order_id 与 pending_hours（未开单为 None）；
+    - orders 为范围内该点已开的补抄单 [{'order_id', 'day', 'total', 'pending'}]。
+    用量与待补整点数在同一读事务里由同一份已提交数据算出。
+    """
+    days, gaps, total = usage_range(conn, point, start_day, end_day)
+    orders = []
+    for row in conn.execute(
+        "SELECT * FROM supplement_orders WHERE point = ? AND day >= ? AND day <= ?"
+        " ORDER BY day",
+        (point, start_day, end_day),
+    ).fetchall():
+        states = slot_states(conn, row)
+        pending = sum(1 for s in states if s["status"] == SLOT_PENDING)
+        orders.append(
+            {
+                "order_id": row["id"],
+                "day": row["day"],
+                "total": len(states),
+                "pending": pending,
+            }
+        )
+    by_day = {o["day"]: o for o in orders}
+    for d in days:
+        o = by_day.get(d["day"])
+        d["order_id"] = o["order_id"] if o else None
+        d["pending_hours"] = o["pending"] if o else None
+        d["missing_hours"] = d["pending_hours"]  # 同义别名：单上仍缺读数的整点数
+    return days, gaps, total, orders
+
+
+def parse_order_csv(text):
+    """解析补抄单上按原格式上传的读数 CSV：返回 ({(point, ts): Decimal}, 行数)。
+
+    沿用原读数 CSV 的表头与取值校验；点/时刻是否属于本单由事务内校验。
+    """
+    return parse_readings_csv(text)
+
+
+def apply_supplement(conn, upload_id, order, mapping):
+    """把一批补抄读数写进补抄单。返回 (新增读数, 跳过读数, 新增核验, 跳过核验)。
+
+    只接收该单计量点、该单 UTC 日内、且落在单上整点的行：
+    - 该整点尚无读数：插入读数，沿用原读数校验（非负、不得倒退、同刻不同值拒绝）；
+    - 该整点已有读数且与已入库值相同：登记核验，电量仍只算一次；
+    - 该整点已有读数但值不同：BatchRejected，整批回滚。
+    核验与新读数在同一事务一起生效；失败由调用方回滚，旧核验/读数/用量保持不变。
+    """
+    point, day = order["point"], order["day"]
+    allowed = {
+        r["ts"]
+        for r in conn.execute(
+            "SELECT ts FROM supplement_slots WHERE order_id = ?", (order["id"],)
+        ).fetchall()
+    }
+    day_lo, day_hi = day_bounds(day)
+    for (p, ts) in mapping:
+        if p != point:
+            raise BatchRejected(
+                f"补抄单只收计量点 {point} 的读数，CSV 中出现 {p}，整批拒绝"
+            )
+        if not (day_lo <= ts < day_hi):
+            raise BatchRejected(
+                f"补抄单只收 {day}（UTC）的读数，CSV 中出现 {fmt_ts(ts)}，整批拒绝"
+            )
+        if hour_of_day(ts) != ts or ts not in allowed:
+            raise BatchRejected(
+                f"补抄单只收开单时缺读数的整点，{fmt_ts(ts)} 不在本单上，整批拒绝"
+            )
+
+    readings_applied = readings_skipped = 0
+    verified_applied = verified_skipped = 0
+    errors = []
+    for (_, ts), val in sorted(mapping.items()):
+        row = conn.execute(
+            "SELECT value FROM readings WHERE point = ? AND ts = ?", (point, ts)
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO readings(point, ts, value, upload_id) VALUES (?,?,?,?)",
+                (point, ts, value_str(val), upload_id),
+            )
+            readings_applied += 1
+            errors.clear()
+            errors.extend(find_negative_deltas(conn, point))
+            if errors:
+                raise BatchRejected("读数倒退，整批拒绝：" + "；".join(errors[:5]))
+        elif Decimal(row["value"]) != val:
+            raise BatchRejected(
+                f"计量点 {point} 在 {fmt_ts(ts)} 已存在不同读数"
+                f"（现有 {row['value']}，本次 {value_str(val)}），整批拒绝"
+            )
+        # 同值重传：读数已在库，不再插入，但仍可据此登记/核对现场核验
+        if row is not None:
+            readings_skipped += 1
+
+        existing = conn.execute(
+            "SELECT value FROM verifications WHERE order_id = ? AND ts = ?",
+            (order["id"], ts),
+        ).fetchone()
+        if existing is not None:
+            if Decimal(existing["value"]) != val:
+                raise BatchRejected(
+                    f"补抄单在 {fmt_ts(ts)} 已登记不同核验值"
+                    f"（现有 {existing['value']}，本次 {value_str(val)}），整批拒绝"
+                )
+            verified_skipped += 1
+            continue
+        conn.execute(
+            "INSERT INTO verifications(order_id, ts, value, upload_id, created_at)"
+            " VALUES (?,?,?,?,?)",
+            (order["id"], ts, value_str(val), upload_id, now_ts()),
+        )
+        verified_applied += 1
+    return readings_applied, readings_skipped, verified_applied, verified_skipped
+
+

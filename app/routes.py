@@ -17,7 +17,7 @@ from .db import get_db
 
 bp = Blueprint("main", __name__)
 
-KIND_NAMES = {"readings": "读数", "swaps": "换表"}
+KIND_NAMES = {"readings": "读数", "swaps": "换表", "supplement": "补抄"}
 
 
 def data_version(conn):
@@ -33,19 +33,21 @@ def list_points(conn):
         for r in conn.execute(
             "SELECT point FROM ("
             "  SELECT point FROM readings UNION SELECT point FROM swaps"
+            "  UNION SELECT point FROM supplement_orders"
             ") ORDER BY point"
         )
     ]
 
 
-def record_rejected(conn, kind, filename, message, rows_received):
+def record_rejected(conn, kind, filename, message, rows_received, order_id=None):
     """被拒批次单独落一条审计记录（不影响既有数据）；审计失败不掩盖原始错误。"""
     try:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             "INSERT INTO uploads(kind, filename, status, message, rows_received,"
-            " rows_applied, created_at) VALUES (?,?,?,?,?,0,?)",
-            (kind, filename, "rejected", message, rows_received, logic.now_ts()),
+            " rows_applied, order_id, created_at) VALUES (?,?,?,?,?,0,?,?)",
+            (kind, filename, "rejected", message, rows_received, order_id,
+             logic.now_ts()),
         )
         conn.execute("COMMIT")
     except sqlite3.Error:
@@ -89,6 +91,8 @@ def upload(kind):
 
     conn = get_db()
     # 1) 解析与格式校验（不进事务）
+    if kind == "supplement":
+        return _upload_supplement(conn, f.filename, text)
     try:
         if kind == "readings":
             parsed, raw_count = logic.parse_readings_csv(text)
@@ -129,6 +133,164 @@ def upload(kind):
     return redirect(url_for("main.index"))
 
 
+def _upload_supplement(conn, filename, text):
+    """按补抄单分批上传原格式读数 CSV。
+
+    只收单上的计量点与整点；核验与新读数在同一事务一起生效，
+    任何失败整体回滚，旧核验/读数/用量版本保持不变。
+    """
+    order_id = request.form.get("order_id", type=int)
+    redirect_to = url_for("main.supplement_order", order_id=order_id) \
+        if order_id else url_for("main.index")
+    if not order_id:
+        flash("请从补抄单页面选择要补抄的单", "error")
+        return redirect(url_for("main.index"))
+    order = conn.execute(
+        "SELECT * FROM supplement_orders WHERE id = ?", (order_id,)
+    ).fetchone()
+    if order is None:
+        flash("补抄单不存在", "error")
+        return redirect(url_for("main.index"))
+
+    try:
+        parsed, raw_count = logic.parse_order_csv(text)
+    except logic.CsvError as e:
+        record_rejected(conn, "supplement", filename, str(e), 0, order_id)
+        flash(f"上传被拒绝：{e}", "error")
+        return redirect(redirect_to)
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        order = conn.execute(
+            "SELECT * FROM supplement_orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        cur = conn.execute(
+            "INSERT INTO uploads(kind, filename, status, message, rows_received,"
+            " rows_applied, order_id, created_at) VALUES (?,?,?,?,?,0,?,?)",
+            ("supplement", filename, "applied", "", raw_count, order_id,
+             logic.now_ts()),
+        )
+        upload_id = cur.lastrowid
+        r_applied, r_skipped, v_applied, v_skipped = logic.apply_supplement(
+            conn, upload_id, order, parsed
+        )
+        msg = (
+            f"接收 {raw_count} 行，新增读数 {r_applied} 条，"
+            f"已到数跳过 {r_skipped} 条；登记核验 {v_applied} 条，"
+            f"核验重复 {v_skipped} 条"
+        )
+        conn.execute(
+            "UPDATE uploads SET rows_applied = ?, message = ? WHERE id = ?",
+            (r_applied, msg, upload_id),
+        )
+        conn.execute("COMMIT")
+        flash(f"补抄单 #{order_id} 上传成功：{msg}", "success")
+    except logic.BatchRejected as e:
+        conn.execute("ROLLBACK")
+        record_rejected(conn, "supplement", filename, str(e), raw_count, order_id)
+        flash(f"上传被拒绝：{e}", "error")
+    except sqlite3.OperationalError as e:
+        conn.execute("ROLLBACK")
+        flash(f"系统繁忙，请重试（{e}）", "error")
+    return redirect(redirect_to)
+
+
+@bp.route("/supplement")
+def supplement():
+    conn = get_db()
+    conn.execute("BEGIN")
+    try:
+        points = list_points(conn)
+        orders = []
+        for o in logic.list_orders(conn):
+            states = logic.slot_states(conn, o)
+            orders.append(
+                {
+                    "order": o,
+                    "total": len(states),
+                    "pending": sum(1 for s in states if s["status"] == logic.SLOT_PENDING),
+                    "regular": sum(1 for s in states if s["status"] == logic.SLOT_REGULAR),
+                    "verified": sum(1 for s in states if s["status"] == logic.SLOT_VERIFIED),
+                }
+            )
+        version = data_version(conn)
+    finally:
+        conn.execute("COMMIT")
+    return render_template(
+        "supplement.html",
+        points=points,
+        orders=orders,
+        last_closed_day=logic.last_closed_day().strftime("%Y-%m-%d"),
+        version=version,
+    )
+
+
+@bp.route("/supplement/open", methods=["POST"])
+def supplement_open():
+    point = request.form.get("point", "").strip()
+    day = request.form.get("day", "").strip()
+    if not point or not day:
+        flash("请选择计量点和已结束的 UTC 日", "error")
+        return redirect(url_for("main.supplement"))
+    try:
+        day = logic.parse_day(day).strftime("%Y-%m-%d")
+    except ValueError as e:
+        flash(str(e), "error")
+        return redirect(url_for("main.supplement"))
+
+    conn = get_db()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        order, created = logic.open_order(conn, point, day)
+        conn.execute("COMMIT")
+    except logic.OrderError as e:
+        conn.execute("ROLLBACK")
+        flash(f"无法开单：{e}", "error")
+        return redirect(url_for("main.supplement"))
+    except sqlite3.OperationalError as e:
+        conn.execute("ROLLBACK")
+        flash(f"系统繁忙，请重试（{e}）", "error")
+        return redirect(url_for("main.supplement"))
+    if created:
+        flash(
+            f"已开补抄单 #{order['id']}：{point} / {day}（UTC）。"
+            "请记下开单时缺读数的整点。",
+            "success",
+        )
+    else:
+        flash(f"{point} / {day} 已开过补抄单，返回原单 #{order['id']}。", "success")
+    return redirect(url_for("main.supplement_order", order_id=order["id"]))
+
+
+@bp.route("/supplement/<int:order_id>")
+def supplement_order(order_id):
+    conn = get_db()
+    conn.execute("BEGIN")
+    try:
+        order = conn.execute(
+            "SELECT * FROM supplement_orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        if order is None:
+            abort(404)
+        states = logic.slot_states(conn, order)
+        _, _, total = logic.usage_range(conn, order["point"], order["day"], order["day"])
+        uploads = conn.execute(
+            "SELECT * FROM uploads WHERE order_id = ? ORDER BY id DESC", (order_id,)
+        ).fetchall()
+        version = data_version(conn)
+    finally:
+        conn.execute("COMMIT")
+    return render_template(
+        "supplement_order.html",
+        order=order,
+        slots=states,
+        total=total,
+        uploads=uploads,
+        version=version,
+        pending_count=sum(1 for s in states if s["status"] == logic.SLOT_PENDING),
+    )
+
+
 def _resolve_range(conn, point, start, end):
     """校验/补全日期范围，返回 (start_day, end_day)。缺省时取该点数据最近 31 天。"""
     if start and end:
@@ -162,12 +324,14 @@ def usage():
     try:
         points = list_points(conn)
         version = data_version(conn)
-        days = gaps = total = None
+        days = gaps = total = orders = None
         error = None
         if point:
             try:
                 start, end = _resolve_range(conn, point, start, end)
-                days, gaps, total = logic.usage_range(conn, point, start, end)
+                days, gaps, total, orders = logic.usage_with_orders(
+                    conn, point, start, end
+                )
             except ValueError as e:
                 error = str(e)
     finally:
@@ -181,6 +345,7 @@ def usage():
         days=days,
         gaps=gaps,
         total=total,
+        orders=orders,
         error=error,
         version=version,
     )
@@ -200,7 +365,9 @@ def api_usage():
             start, end = _resolve_range(conn, point, start, end)
         except ValueError as e:
             return jsonify(error=str(e)), 400
-        days, gaps, total = logic.usage_range(conn, point, start, end)
+        days, gaps, total, orders = logic.usage_with_orders(
+            conn, point, start, end
+        )
         version = data_version(conn)
     finally:
         conn.execute("COMMIT")
@@ -211,8 +378,23 @@ def api_usage():
         version=version,
         total_kwh=logic.fmt_num(total),
         days=[
-            {"day": d["day"], "kwh": logic.fmt_num(d["kwh"]), "gap": d["gap"]}
+            {
+                "day": d["day"],
+                "kwh": logic.fmt_num(d["kwh"]),
+                "gap": d["gap"],
+                "order_id": d["order_id"],
+                "pending_hours": d["pending_hours"],
+            }
             for d in days
+        ],
+        orders=[
+            {
+                "order_id": o["order_id"],
+                "day": o["day"],
+                "total_hours": o["total"],
+                "pending_hours": o["pending"],
+            }
+            for o in orders
         ],
         gaps=[{"start": g["start"], "end": g["end"]} for g in gaps],
     )

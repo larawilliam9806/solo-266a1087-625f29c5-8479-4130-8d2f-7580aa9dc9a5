@@ -27,12 +27,18 @@
   <p>合计用量：<strong>{{ total | fmt_num }}</strong> kWh
      （数据版本 v{{ version }}，增量计入后次读数所属 UTC 日）</p>
   <table>
-    <thead><tr><th>日期 (UTC)</th><th>用量 (kWh)</th><th>备注</th></tr></thead>
+    <thead><tr><th>日期 (UTC)</th><th>用量 (kWh)</th><th>补抄单缺读数整点</th><th>备注</th></tr></thead>
     <tbody>
       {% for d in days %}
       <tr class="{{ 'gapday' if d.gap }}">
         <td>{{ d.day }}</td>
         <td class="num">{{ d.kwh | fmt_num }}</td>
+        <td>
+          {% if d.order_id %}
+          <a href="{{ url_for('main.supplement_order', order_id=d.order_id) }}">#{{ d.order_id }}</a>：
+          仍缺 {{ d.pending_hours }} 个整点
+          {% else %}—{% endif %}
+        </td>
         <td>{{ '含缺口区间' if d.gap }}</td>
       </tr>
       {% endfor %}

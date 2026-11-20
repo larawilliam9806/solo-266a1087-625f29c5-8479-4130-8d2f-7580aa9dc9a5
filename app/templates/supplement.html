@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}补抄单 - 电量日核算{% endblock %}
+{% block content %}
+<section class="card">
+  <h2>开补抄单</h2>
+  <p class="hint">
+    整点漏采后，现场人员可从电表取回当时保存的读数。选择计量点和一个<strong>已结束的 UTC 日</strong>开单，
+    系统会记下开单时缺读数的整点；同一点同一天再次开单会返回原单。
+    单内可按原格式分批上传读数 CSV，只收单上的计量点和整点。
+  </p>
+  <form method="post" action="{{ url_for('main.supplement_open') }}" class="query">
+    <label>计量点
+      <select name="point" required>
+        <option value="" disabled selected>请选择</option>
+        {% for p in points %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>UTC 日 <input type="date" name="day" max="{{ last_closed_day }}" value="{{ last_closed_day }}" required></label>
+    <button type="submit">开单</button>
+    <span class="hint">最新可开单日期：{{ last_closed_day }}（昨天，UTC）</span>
+  </form>
+  {% if not points %}<p class="hint">暂无计量点，请先上传读数 CSV。</p>{% endif %}
+</section>
+
+<section class="card">
+  <h2>补抄单列表</h2>
+  <table>
+    <thead>
+      <tr><th>单号</th><th>计量点</th><th>UTC 日</th><th>开单时间</th>
+          <th>单上整点</th><th>待补</th><th>常规到数</th><th>现场已核</th></tr>
+    </thead>
+    <tbody>
+      {% for it in orders %}
+      <tr>
+        <td><a href="{{ url_for('main.supplement_order', order_id=it.order['id']) }}">#{{ it.order['id'] }}</a></td>
+        <td>{{ it.order['point'] }}</td>
+        <td><a href="{{ url_for('main.usage', point=it.order['point'], start=it.order['day'], end=it.order['day']) }}">{{ it.order['day'] }}</a></td>
+        <td>{{ it.order['created_at'] | fmt_ts }}</td>
+        <td>{{ it.total }}</td>
+        <td>{{ it.pending }}</td>
+        <td>{{ it.regular }}</td>
+        <td>{{ it.verified }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="hint">暂无补抄单</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

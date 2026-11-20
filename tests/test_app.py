@@ -306,3 +306,269 @@ def test_concurrent_identical_uploads_idempotent(app):
     assert not errors, errors
     r = usage(app.test_client(), "A", "2026-01-02", "2026-01-02")
     assert day_kwh(r, "2026-01-02") == "50"  # 并发重传不重复计数
+
+
+# ---------------------------------------------------------------- 补抄单
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+
+def closed_day(days_ago=1):
+    return (datetime.now(timezone.utc).date() - timedelta(days=days_ago)).strftime(
+        "%Y-%m-%d"
+    )
+
+
+def open_order(client, point, day):
+    return client.post(
+        "/supplement/open", data={"point": point, "day": day}, follow_redirects=True
+    )
+
+
+def order_page(client, order_id):
+    resp = client.get(f"/supplement/{order_id}")
+    assert resp.status_code == 200
+    return resp.get_data(as_text=True)
+
+
+def upload_order(client, order_id, csv_text):
+    data = {
+        "file": (io.BytesIO(csv_text.encode("utf-8")), "sup.csv"),
+        "order_id": str(order_id),
+    }
+    return client.post(
+        "/upload/supplement", data=data, content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+
+
+def seed_hourly(client, point, day, values):
+    """上传某日若干整点读数，values 形如 {'00': 100, '01': 110}。"""
+    lines = ["point,ts,value"]
+    for hh, v in values.items():
+        lines.append(f"{point},{day}T{hh}:00:00Z,{v}")
+    upload(client, "readings", "\n".join(lines) + "\n")
+
+
+def test_open_order_snapshots_missing_hours_and_dedups(client):
+    day = closed_day()
+    seed_hourly(client, "A", day, {"00": 100, "01": 110})
+    resp = open_order(client, "A", day)
+    assert "已开补抄单" in resp.get_data(as_text=True)
+    body = order_page(client, 1)
+    # 00、01 已有读数，不在单上；其余 22 个整点待补
+    assert "仍待补 22 个" in body
+    assert body.count("待补") >= 22
+
+    # 同一点同一天再次开单：返回原单，不新建
+    resp = open_order(client, "A", day)
+    assert "返回原单 #1" in resp.get_data(as_text=True)
+    assert client.get("/supplement/2").status_code == 404
+
+
+def test_open_order_rejects_unfinished_day(client):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+    seed_hourly(client, "A", today, {"00": 1})
+    assert "尚未结束" in open_order(client, "A", today).get_data(as_text=True)
+    assert "尚未结束" in open_order(client, "A", tomorrow).get_data(as_text=True)
+
+
+def test_supplement_upload_fills_missing_hours(client):
+    day = closed_day()
+    seed_hourly(client, "A", day, {"00": 100})
+    open_order(client, "A", day)
+    r = usage(client, "A", day, day)
+    assert day_kwh(r, day) == "0"            # 只有首条读数，尚无增量
+    assert r["days"][0]["pending_hours"] == 23
+
+    csv_text = (
+        f"point,ts,value\nA,{day}T01:00:00Z,105\nA,{day}T02:00:00Z,107\n"
+    )
+    resp = upload_order(client, 1, csv_text)
+    body = resp.get_data(as_text=True)
+    assert "补抄单 #1 上传成功" in body and "新增读数 2 条" in body
+
+    r = usage(client, "A", day, day)
+    # 增量计入后次读数所属日：0 点→1 点 5，1 点→2 点 2
+    assert day_kwh(r, day) == "7"
+    assert r["days"][0]["pending_hours"] == 21
+    body = order_page(client, 1)
+    assert "常规到数" not in body            # 补抄读数不算“常规到数”
+    assert body.count("现场已核") >= 2
+
+
+def test_supplement_only_accepts_order_point_and_hours(client):
+    day = closed_day()
+    seed_hourly(client, "A", day, {"00": 100})
+    open_order(client, "A", day)
+
+    # 别的计量点
+    resp = upload_order(
+        client, 1, f"point,ts,value\nB,{day}T01:00:00Z,50\n"
+    )
+    assert "只收计量点 A" in resp.get_data(as_text=True)
+    # 别的日期
+    other = closed_day(2)
+    resp = upload_order(
+        client, 1, f"point,ts,value\nA,{other}T05:00:00Z,50\n"
+    )
+    assert "只收" in resp.get_data(as_text=True) and "整批拒绝" in resp.get_data(as_text=True)
+    # 非整点
+    resp = upload_order(
+        client, 1, f"point,ts,value\nA,{day}T05:30:00Z,50\n"
+    )
+    assert "不在本单上" in resp.get_data(as_text=True)
+    # 单外整点（00 点开单时已有读数，不在单上）
+    resp = upload_order(
+        client, 1, f"point,ts,value\nA,{day}T00:00:00Z,100\n"
+    )
+    assert "不在本单上" in resp.get_data(as_text=True)
+
+    r = usage(client, "A", day, day)
+    assert day_kwh(r, day) == "0"            # 全部被拒，数据不变
+
+
+def test_supplement_regular_upload_marks_regular(client):
+    day = closed_day()
+    seed_hourly(client, "A", day, {"00": 100})
+    open_order(client, "A", day)
+    # 常规上传照常收数，落在单上整点
+    upload(client, "readings", f"point,ts,value\nA,{day}T01:00:00Z,104\n")
+    body = order_page(client, 1)
+    assert "常规到数" in body
+    r = usage(client, "A", day, day)
+    assert day_kwh(r, day) == "4"
+    assert r["days"][0]["pending_hours"] == 22
+
+
+def test_supplement_same_value_registers_verification_without_double_count(client):
+    day = closed_day()
+    seed_hourly(client, "A", day, {"00": 100})
+    open_order(client, "A", day)
+    upload(client, "readings", f"point,ts,value\nA,{day}T02:00:00Z,130\n")
+    r = usage(client, "A", day, day)
+    assert day_kwh(r, day) == "30"
+
+    # 现场回报与已入库读数同值：登记核验，电量不重复计
+    resp = upload_order(client, 1, f"point,ts,value\nA,{day}T02:00:00Z,130\n")
+    body = resp.get_data(as_text=True)
+    assert "登记核验 1 条" in body
+    assert "现场已核" in order_page(client, 1)
+    r = usage(client, "A", day, day)
+    assert day_kwh(r, day) == "30"           # 只算一次
+    assert r["days"][0]["pending_hours"] == 22
+
+    # 再次原样回报：核验也幂等
+    resp = upload_order(client, 1, f"point,ts,value\nA,{day}T02:00:00Z,130\n")
+    assert "核验重复 1 条" in resp.get_data(as_text=True)
+    assert day_kwh(usage(client, "A", day, day), day) == "30"
+
+
+def test_supplement_conflict_and_failed_batch_keeps_everything(client):
+    day = closed_day()
+    seed_hourly(client, "A", day, {"00": 100})
+    open_order(client, "A", day)
+    assert "新增读数 1 条" in upload_order(
+        client, 1, f"point,ts,value\nA,{day}T01:00:00Z,110\n"
+    ).get_data(as_text=True)
+    before = usage(client, "A", day, day)
+    assert day_kwh(before, day) == "10"
+
+    # 同刻不同值 → 整批拒绝，原读数、核验、用量版本都不变
+    resp = upload_order(
+        client, 1,
+        f"point,ts,value\nA,{day}T02:00:00Z,200\nA,{day}T01:00:00Z,111\n",
+    )
+    assert "已存在不同读数" in resp.get_data(as_text=True)
+    after = usage(client, "A", day, day)
+    assert after["total_kwh"] == before["total_kwh"]
+    assert after["days"][0]["pending_hours"] == before["days"][0]["pending_hours"]
+    assert after["version"] == before["version"]   # 失败不推进版本
+    body = order_page(client, 1)
+    assert "现场已核" in body                      # 先前核验保留
+    assert body.count("待补") >= 1                 # 失败批次没有登记 02 点
+
+
+def test_supplement_backwards_reading_rejected(client):
+    day = closed_day()
+    seed_hourly(client, "A", day, {"00": 100, "02": 130})
+    open_order(client, "A", day)
+    resp = upload_order(client, 1, f"point,ts,value\nA,{day}T01:00:00Z,200\n")
+    assert "读数倒退" in resp.get_data(as_text=True)
+    assert day_kwh(usage(client, "A", day, day), day) == "30"
+
+
+def test_usage_pages_and_api_show_pending_hours_for_opened_days(client):
+    day = closed_day()
+    seed_hourly(client, "A", day, {"00": 100})
+    open_order(client, "A", day)
+    r = usage(client, "A", day, day)
+    assert r["days"][0]["pending_hours"] == 23
+    assert r["days"][0]["order_id"] == 1
+    assert r["orders"] == [
+        {"order_id": 1, "day": day, "total_hours": 23, "pending_hours": 23}
+    ]
+    body = client.get(
+        f"/usage?point=A&start={day}&end={day}"
+    ).get_data(as_text=True)
+    assert "仍缺 23 个整点" in body
+
+    # 未开单日期：pending_hours 为 null，不虚构数字
+    r2 = usage(client, "A", closed_day(3), closed_day(3))
+    assert r2["days"][0]["pending_hours"] is None
+    assert r2["orders"] == []
+
+
+def test_supplement_batches_accumulate_and_verification_beats_regular(client):
+    day = closed_day()
+    seed_hourly(client, "A", day, {"00": 100})
+    open_order(client, "A", day)
+    # 分批：先补 01，再补 02
+    assert "新增读数 1 条" in upload_order(
+        client, 1, f"point,ts,value\nA,{day}T01:00:00Z,110\n"
+    ).get_data(as_text=True)
+    assert "新增读数 1 条" in upload_order(
+        client, 1, f"point,ts,value\nA,{day}T02:00:00Z,125\n"
+    ).get_data(as_text=True)
+    r = usage(client, "A", day, day)
+    assert day_kwh(r, day) == "25"
+    assert r["days"][0]["pending_hours"] == 21
+
+    # 常规上传同一整点同值：读数不重复，单上仍为现场已核
+    upload(client, "readings", f"point,ts,value\nA,{day}T01:00:00Z,110\n")
+    assert day_kwh(usage(client, "A", day, day), day) == "25"
+    resp = upload_order(client, 1, f"point,ts,value\nA,{day}T01:00:00Z,110\n")
+    assert "核验重复 1 条" in resp.get_data(as_text=True)
+    body = order_page(client, 1)
+    assert "现场已核" in body
+    assert day_kwh(usage(client, "A", day, day), day) == "25"
+
+
+def test_concurrent_supplement_uploads_idempotent(app):
+    """并发按单补抄同一批读数：不重复计数，也不产生冲突。"""
+    day = closed_day()
+    client = app.test_client()
+    seed_hourly(client, "A", day, {"00": 100})
+    open_order(client, "A", day)
+    csv_text = f"point,ts,value\nA,{day}T01:00:00Z,110\nA,{day}T02:00:00Z,130\n"
+    errors = []
+
+    def do_upload():
+        c = app.test_client()
+        try:
+            resp = upload_order(c, 1, csv_text)
+            if resp.status_code != 200:
+                errors.append(resp.status_code)
+        except Exception as e:  # noqa: BLE001
+            errors.append(str(e))
+
+    threads = [threading.Thread(target=do_upload) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors
+    r = usage(app.test_client(), "A", day, day)
+    assert day_kwh(r, day) == "30"
+    assert r["days"][0]["pending_hours"] == 21
